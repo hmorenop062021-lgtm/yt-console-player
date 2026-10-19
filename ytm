@@ -1,0 +1,1111 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════
+#  ytm - YouTube Music Console Player con interfaz tipo TBrowse
+#  Usa yt-dlp + fzf + mpv + interfaz enriquecida
+# ═══════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+# Contrato de códigos de salida (compartido con *_control.py / exit_codes.py)
+EXIT_OK=0; EXIT_ERROR=1
+EXIT_SEARCH_SONGS=10; EXIT_SEARCH_MUSIC=11
+EXIT_SEARCH_ALBUMS=12; EXIT_SEARCH_PLAYLISTS=13
+
+export PATH="$HOME/.local/bin:$PATH"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VERSION="1.0.0"
+
+# ── Configuración ────────────────────────────────────────────────
+YT_DLP_BIN="${YT_DLP:-yt-dlp}"
+yt_dlp_fn() { "$YT_DLP_BIN" --js-runtimes node --remote-components ejs:github "$@"; }
+YT_DLP="yt_dlp_fn"
+PLAYER="${PLAYER:-mpv}"
+FZF="${FZF:-fzf}"
+JQ="${JQ:-jq}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ytm"
+MAX_RESULTS="${MAX_RESULTS:-30}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads}"
+HISTORY_FILE="$CACHE_DIR/history"
+HISTORY_MAX=50
+LOG_FILE="$CACHE_DIR/events.log"
+LOG_MAX=200
+CACHE_MEDIA_DIR="$CACHE_DIR/media"
+SEARCH_CACHE_TTL="${SEARCH_CACHE_TTL:-86400}"   # 24 h de caché de búsquedas
+PLAYLIST_CACHE_TTL="${PLAYLIST_CACHE_TTL:-86400}" # 24 h de caché de álbumes/playlists
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ytm"
+FAVORITES_FILE="${FAVORITES_FILE:-$CONFIG_DIR/favorites}"
+REFRESH=0
+OPEN_FAVORITES=0
+CLEAR_CACHE=0
+export FAVORITES_FILE
+mkdir -p "$CACHE_DIR" "$CACHE_MEDIA_DIR" "$DOWNLOAD_DIR" "$CONFIG_DIR"
+MPV_LOG="$CACHE_DIR/mpv.log"
+MPV_LOG_MAX_BYTES="${MPV_LOG_MAX_BYTES:-1048576}"
+CACHE_MAX_MB="${CACHE_MAX_MB:-200}"
+MPV_CACHE_MB="${MPV_CACHE_MB:-20}"
+MPV_CACHE_BACK_MB="${MPV_CACHE_BACK_MB:-5}"
+MPV_STREAM_BUFFER_MB="${MPV_STREAM_BUFFER_MB:-2}"
+
+# ── Dependencias requeridas ─────────────────────────────────────
+validate_dependencies() {
+    local deps=("$YT_DLP_BIN" fzf mpv jq python3)
+    local missing=()
+    local dep
+    for dep in "${deps[@]}"; do
+        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "❌ Error: Dependencias faltantes: ${missing[*]}" >&2
+        echo "Por favor, instálalas antes de continuar." >&2
+        exit 1
+    fi
+}
+validate_dependencies
+
+# ── Colores ANSI ────────────────────────────────────────────────
+R='\033[0m'    B='\033[1m'    D='\033[2m'
+RED='\033[31m' GRN='\033[32m' YLW='\033[33m'
+BLU='\033[34m' MAG='\033[35m' CYN='\033[36m' WHT='\033[37m'
+BRED='\033[1;31m' BGRN='\033[1;32m' BYLW='\033[1;33m'
+BBLU='\033[1;34m' BMAG='\033[1;35m' BCYN='\033[1;36m' BWHT='\033[1;37m'
+
+# ── Terminal width (recalculated every render) ──────────────────
+_get_cols() { tput cols 2>/dev/null || echo 80; }
+
+# ── Wide-character length: emojis + CJK = 2 cols each ──────────
+# Uses python for reliable counting since bash can't handle multi-byte.
+_vis_len() {
+    # Strips ANSI, then counts display width (emojis=2, CJK=2, rest=1)
+    python3 -c "
+import sys, unicodedata, re
+s = sys.argv[1]
+# strip ANSI
+s = re.sub(r'\033\[[0-9;]*m', '', s)
+w = 0
+for ch in s:
+    eaw = unicodedata.east_asian_width(ch)
+    w += 2 if eaw in ('W', 'F') else 1
+print(w)
+" "$1" 2>/dev/null || {
+        # Fallback: strip ANSI and count bytes (rough)
+        local stripped
+        stripped=$(echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g')
+        echo "${#stripped}"
+    }
+}
+
+# ── Repeat char helper (no seq overhead) ───────────────────────
+_repeat() {
+    printf "%0.s$1" $(seq 1 "$2")
+}
+
+# ── Box drawing: center text in a box ──────────────────────────
+_box_line() {
+    # box_line <char> <width>
+    local ch="$1" w="$2"
+    printf '%s' "$ch"
+    printf '%0.s' $(seq 1 $((w - 2)) 2>/dev/null)
+    printf '%s' "$ch"
+}
+
+_box_center() {
+    # Print: │ <centered text> │  — respects vis_len for padding
+    # _box_center <text> <width> <border_color>
+    local text="$1" w="${2:-$(_get_cols)}" bc="${3:-$BCYN}"
+    local vlen
+    vlen=$(_vis_len "$text")
+    local inner=$((w - 2))  # space between │ and │
+    local pad_l=$(( (inner - vlen) / 2 ))
+    local pad_r=$(( inner - vlen - pad_l ))
+    [[ $pad_l -lt 0 ]] && pad_l=0
+    [[ $pad_r -lt 0 ]] && pad_r=0
+    printf "${bc}│${R}"
+    printf '%0.s ' $(seq 1 $pad_l 2>/dev/null)
+    echo -ne "$text"
+    printf '%0.s ' $(seq 1 $pad_r 2>/dev/null)
+    printf "${bc}│${R}\n"
+}
+
+_box_blank() {
+    # │<spaces>│
+    local w="${1:-$(_get_cols)}" bc="${2:-$BCYN}"
+    printf "${bc}│${R}"
+    printf '%0.s ' $(seq 1 $((w - 2)) 2>/dev/null)
+    printf "${bc}│${R}\n"
+}
+
+_box_top()    { printf "${2:-$BCYN}╭"; _repeat "─" $(( ${1:-$(_get_cols)} - 2 )); printf "╮${R}\n"; }
+_box_mid()    { printf "${2:-$BCYN}├"; _repeat "─" $(( ${1:-$(_get_cols)} - 2 )); printf "┤${R}\n"; }
+_box_bottom() { printf "${2:-$BCYN}╰"; _repeat "─" $(( ${1:-$(_get_cols)} - 2 )); printf "╯${R}\n"; }
+
+# ── Full banner ────────────────────────────────────────────────
+_draw_banner() {
+    local w
+    w=$(_get_cols)
+    echo ""
+    _box_top "$w" "$BCYN"
+    _box_center "" "$w" "$BCYN"
+    _box_center "${BMAG}${B}♪  YouTube Music Player  ♪${R}" "$w" "$BCYN"
+    _box_center "${DIM}v$VERSION${R}" "$w" "$BCYN"
+    _box_center "" "$w" "$BCYN"
+    _box_bottom "$w" "$BCYN"
+}
+
+# ── FZF theme (passed per-call, not exported) ──────────────────
+_YTM_FZF_OPTS=(
+    --color=bg:#1a1a2e
+    --color=fg:#e0e0e0
+    --color=spinner:#ff6e06
+    --color=hl:#ff6e06
+    --color=fg+:#ffffff
+    --color=bg+:#16213e
+    --color=info:#ff6e06
+    --color=prompt:#ff6e06
+    --color=pointer:#ff6e06
+    --color=marker:#ff6e06
+    --color=header:#ff6e06
+    --color=border:#ff6e06
+    --border=double
+    --border-label-pos=-2
+    --margin=0,2
+    --info=inline
+    --layout=reverse
+    --height=70%
+    --prompt="  ♪ "
+    --pointer="▶"
+    --marker="✦"
+    --separator="─"
+    --scrollbar="│"
+)
+
+# ── Event log ───────────────────────────────────────────────────
+log_event() {
+    local level="$1" message="$2"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] | $message" >> "$LOG_FILE" 2>/dev/null || true
+    local tmp_log="$LOG_FILE.tmp"
+    tail -n "$LOG_MAX" "$LOG_FILE" > "$tmp_log" 2>/dev/null && mv "$tmp_log" "$LOG_FILE" 2>/dev/null || true
+}
+
+# Log de errores inesperados (bajo set -e)
+trap 'log_event "ERROR" "unexpected error: line $LINENO | cmd: $BASH_COMMAND | rc=$?"' ERR
+
+# ── Cache ───────────────────────────────────────────────────────
+get_cached_file() {
+    local url_or_id="$1"
+    local id=""
+    if [[ "$url_or_id" =~ ^https?:// ]]; then
+        if [[ "$url_or_id" =~ v=([^&]+) ]]; then
+            id="${BASH_REMATCH[1]}"
+        elif [[ "$url_or_id" =~ youtu\.be/([^?]+) ]]; then
+            id="${BASH_REMATCH[1]}"
+        fi
+    else
+        id="$url_or_id"
+    fi
+
+    if [[ -n "$id" ]]; then
+        local ttl=${CACHE_TTL:-86400}
+        local now=$(date +%s)
+        for f in "$CACHE_MEDIA_DIR/$id".*; do
+            [[ -f "$f" && ! "$f" =~ \.(part|ytdl|temp)$ ]] || continue
+            local mtime
+            mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+            local age=$(( now - mtime ))
+            [[ "$age" -le "$ttl" ]] && echo "$f" && return 0
+        done
+    fi
+    return 1
+}
+
+prune_cache() {
+    local max_files=50
+    local max_age=$(( 24 * 3600 ))
+    [[ -n "$CACHE_TTL" ]] && max_age="$CACHE_TTL"
+    [[ -d "$CACHE_MEDIA_DIR" ]] || return 0
+
+    local now f mtime age
+    now=$(date +%s)
+    for f in "$CACHE_MEDIA_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        age=$(( now - mtime ))
+        [[ "$age" -le "$max_age" ]] || rm -f "$f"
+    done
+
+    local count
+    count=$(find "$CACHE_MEDIA_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    if [[ "$count" -gt "$max_files" ]]; then
+        while IFS= read -r f; do
+            [[ "$count" -le "$max_files" ]] && break
+            rm -f "$f"
+            count=$((count - 1))
+        done < <(find "$CACHE_MEDIA_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+    fi
+}
+
+# ── Idle inhibition ────────────────────────────────────────────
+_INHIBIT_PID=
+_XSET_AWAKE=0
+INHIBIT_IDLE=0
+
+start_inhibit() {
+    [[ "$INHIBIT_IDLE" == "0" ]] && return
+    if command -v systemd-inhibit &>/dev/null && [[ -z "${_INHIBIT_PID:-}" ]]; then
+        systemd-inhibit --why="Playing music with ytm" sleep infinity &
+        _INHIBIT_PID=$!; disown "$_INHIBIT_PID" 2>/dev/null || true; return
+    fi
+    if command -v xset &>/dev/null && [[ "$_XSET_AWAKE" == "0" ]] && [[ -n "${DISPLAY:-}" ]]; then
+        _DPMS_STATE=$(xset -q 2>/dev/null | grep -i 'dpms is' | head -1)
+        xset -dpms 2>/dev/null || true; xset s off 2>/dev/null || true; _XSET_AWAKE=1
+    fi
+}
+
+stop_inhibit() {
+    if [[ -n "${_INHIBIT_PID:-}" ]]; then
+        pkill -TERM -P "$_INHIBIT_PID" 2>/dev/null || true
+        kill "$_INHIBIT_PID" 2>/dev/null || true
+        _INHIBIT_PID=
+    fi
+    if [[ "$_XSET_AWAKE" == "1" ]]; then
+        if [[ "${_DPMS_STATE:-}" =~ Enabled ]]; then xset +dpms 2>/dev/null || true
+        else xset -dpms 2>/dev/null || true; fi
+        xset s on 2>/dev/null || true; _XSET_AWAKE=0
+    fi
+}
+
+# ── Equalizer presets ──────────────────────────────────────────
+declare -A EQ_PRESETS=(
+    [bass]="equalizer=f=60:t=q:w=1.0:g=6,equalizer=f=150:t=q:w=0.8:g=3,equalizer=f=300:t=q:w=0.6:g=1"
+    [vocal]="equalizer=f=400:t=q:w=0.6:g=2,equalizer=f=1000:t=q:w=0.8:g=5,equalizer=f=3000:t=q:w=0.6:g=3,equalizer=f=6000:t=q:w=0.6:g=2"
+    [classical]="equalizer=f=60:t=q:w=1.0:g=4,equalizer=f=250:t=q:w=0.5:g=-2,equalizer=f=1000:t=q:w=0.5:g=-2,equalizer=f=5000:t=q:w=0.8:g=2,equalizer=f=10000:t=q:w=0.8:g=4"
+    [rock]="equalizer=f=80:t=q:w=1.0:g=5,equalizer=f=250:t=q:w=0.6:g=2,equalizer=f=2000:t=q:w=0.6:g=-1,equalizer=f=5000:t=q:w=0.8:g=3,equalizer=f=10000:t=q:w=0.8:g=4"
+    [pop]="equalizer=f=60:t=q:w=0.8:g=3,equalizer=f=250:t=q:w=0.6:g=2,equalizer=f=1000:t=q:w=0.8:g=4,equalizer=f=5000:t=q:w=0.8:g=2,equalizer=f=10000:t=q:w=0.8:g=3"
+    [jazz]="equalizer=f=60:t=q:w=1.0:g=4,equalizer=f=400:t=q:w=0.6:g=3,equalizer=f=1000:t=q:w=0.5:g=1,equalizer=f=3000:t=q:w=0.6:g=2,equalizer=f=8000:t=q:w=0.6:g=3"
+    [full]="equalizer=f=60:t=q:w=1.0:g=4,equalizer=f=250:t=q:w=0.6:g=1,equalizer=f=1000:t=q:w=0.5:g=1,equalizer=f=5000:t=q:w=0.6:g=2,equalizer=f=10000:t=q:w=0.6:g=3"
+    [flat]=""
+)
+
+# ── Parse options ──────────────────────────────────────────────
+AUDIO_ONLY=1
+DOWNLOAD=0
+LIST_ONLY=0
+FORMAT="bestaudio/best"
+EQ_PRESET=""
+SPEED_FACTOR=""
+SEARCH_QUERY=()
+SHOW_LOG=0
+LOG_FILTER=""
+LOG_TAIL=0
+LOG_CLEAR=0
+SEARCH_TYPE="songs"
+YTM_MODE="auto"
+PLAY_COUNT=0
+
+show_help() {
+    echo "  📦 ytm v$VERSION"
+    echo ""
+    cat <<'HELP'
+╔══════════════════════════════════════════════════════════════╗
+║           🎵  ytm - YouTube Music Player  🎵                ║
+╚══════════════════════════════════════════════════════════════╝
+
+USO:
+  ytm <búsqueda>              Menú interactivo + búsqueda
+  ytm -s <búsqueda>           Buscar canciones directamente
+  ytm -a <búsqueda>           Buscar álbumes
+  ytm -p <búsqueda>           Buscar playlists
+  ytm -d <búsqueda>           Modo descarga
+
+MENÚ PRINCIPAL (sin argumentos):
+  [1] 🎵  Canciones      Buscar y reproducir canciones
+  [2] 💿  Álbumes        Explorar álbumes completos
+  [3] 📜  Playlists      Listas de reproducción
+  [4] 🔀  Artista        Buscar por artista
+  [5] 📖  Historial      Buscar en historial reciente
+  [6] ⭐  Favoritos      Reproducir pistas favoritas
+  [7] ⚙️   Configuración  Cambiar opciones
+  [q] 🚪  Salir
+
+OPCIONES:
+  -s, --songs       Buscar canciones (solo audio)
+  -a, --albums      Buscar álbumes
+  -p, --playlists   Buscar playlists
+  -d, --download    Descargar en vez de reproducir
+  -l, --list        Solo listar resultados
+  -f, --format FMT  Formato descarga: audio, mp3, 128, 320
+  -n, --number N    Número de resultados (default: 30)
+  -e, --equalizer   Ecualizador: bass, vocal, rock, pop, jazz, classical
+  -S, --speed F     Velocidad (1.0, 1.5, 2.0)
+  -c, --count N     N° de canciones a reproducir (0 = todas)
+  -I, --no-inhibit  No bloquear suspensión
+  -F, --favorites   Abrir directamente los favoritos
+  -R, --refresh     Ignorar caché y volver a buscar
+  --clear-cache     Borrar caché de búsquedas/álbumes
+  --log [filtro]    Ver eventos
+  --tail            Últimos 10 eventos
+  --clear           Limpiar registro
+
+CONTROLES (durante reproducción):
+  [Espacio]  Pausar/Reanudar     [◀ ▶]   -/+ 10s
+  [▲ ▼]      Volumen +/- 5%      [n]     Siguiente pista
+  [b]         Pista anterior      [[ ]]   Velocidad -/+
+  [s]         Buscar YouTube      [m]     Buscar Music (canciones)
+  [a]         Buscar álbumes      [l]     Buscar playlists
+  [f]         Marcar/desmarcar favorito
+  [d]         Descargar canción   [D]     Descargar álbum/playlist
+  [q/Esc]     Detener y salir
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--songs)        YTM_MODE="songs"; shift ;;
+        -a|--albums)       YTM_MODE="albums"; shift ;;
+        -p|--playlists)    YTM_MODE="playlists"; shift ;;
+        -d|--download)     DOWNLOAD=1; shift ;;
+        -l|--list)         LIST_ONLY=1; shift ;;
+        -f|--format)       [[ $# -lt 2 || -z "$2" || "$2" =~ ^- ]] && { echo "❌ -f requiere formato (audio, mp3, 128, 320)"; exit 1; }; FORMAT="$2"; shift 2 ;;
+        -n|--number)       [[ $# -lt 2 || -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "❌ -n/--number requiere un número"; exit 1; }; MAX_RESULTS="$2"; shift 2 ;;
+        -e|--equalizer)    EQ_PRESET="${2:-}"; [[ -z "$EQ_PRESET" || "$EQ_PRESET" =~ ^- ]] && { echo "🎚️  Disponibles: ${!EQ_PRESETS[*]}"; exit 1; }; shift 2 ;;
+        -S|--speed)        [[ $# -lt 2 || -z "$2" ]] && { echo "❌ -S/--speed requiere un factor (ej: 1.5)"; exit 1; }; SPEED_FACTOR="$2"; shift 2 ;;
+        -c|--count)        [[ $# -lt 2 || -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "❌ -c/--count requiere un número"; exit 1; }; PLAY_COUNT="$2"; shift 2 ;;
+        -I|--no-inhibit)   INHIBIT_IDLE=0; shift ;;
+        --log)             SHOW_LOG=1; shift; LOG_FILTER="${1:-}"; [[ -n "$LOG_FILTER" && ! "$LOG_FILTER" =~ ^- ]] && shift || LOG_FILTER="" ;;
+        --tail)            LOG_TAIL=1; shift ;;
+        --clear)           LOG_CLEAR=1; shift ;;
+        -F|--favorites)    OPEN_FAVORITES=1; shift ;;
+        -R|--refresh)      REFRESH=1; shift ;;
+        --clear-cache)     CLEAR_CACHE=1; shift ;;
+        --version)         echo "ytm v$VERSION"; exit 0 ;;
+        -h|--help)         show_help; exit 0 ;;
+        --)                shift; SEARCH_QUERY+=("$@"); break ;;
+        -*)                echo "❌ Opción desconocida: $1"; exit 1 ;;
+        *)                 SEARCH_QUERY+=("$1"); shift ;;
+    esac
+done
+
+# ── Resolve equalizer ─────────────────────────────────────────
+EQ_ARGS=""
+if [[ -n "$EQ_PRESET" ]]; then
+    eq_key="${EQ_PRESET,,}"
+    if [[ -n "${EQ_PRESETS[$eq_key]:-}" ]]; then
+        [[ -n "${EQ_PRESETS[$eq_key]}" ]] && EQ_ARGS="--af=${EQ_PRESETS[$eq_key]}"
+    else
+        echo "⚠️  Ecualizador desconocido: '$EQ_PRESET'" >&2
+    fi
+fi
+
+# ── Resolve speed ─────────────────────────────────────────────
+SPEED_ARGS=""
+if [[ -n "${SPEED_FACTOR:-}" ]]; then
+    if [[ "$SPEED_FACTOR" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v v="$SPEED_FACTOR" 'BEGIN { exit !(v + 0 > 0) }'; then
+        SPEED_ARGS="--speed=$SPEED_FACTOR"
+    else
+        echo "⚠️  Factor de velocidad inválido: '$SPEED_FACTOR'. Usando 1.0x." >&2
+    fi
+fi
+
+# ── Log commands ───────────────────────────────────────────────
+if [[ "$LOG_CLEAR" == "1" ]]; then
+    : > "$LOG_FILE" 2>/dev/null || true; echo "🗑️  Registro limpiado."
+fi
+if [[ "$SHOW_LOG" == "1" ]]; then
+    [[ ! -f "$LOG_FILE" || ! -s "$LOG_FILE" ]] && { echo "📭 Sin eventos."; exit 0; }
+    if [[ "$LOG_TAIL" == "1" ]]; then
+        [[ -n "$LOG_FILTER" ]] && grep -i "$LOG_FILTER" "$LOG_FILE" | tail -10 || tail -10 "$LOG_FILE"
+    elif [[ -n "$LOG_FILTER" ]]; then
+        grep -i "$LOG_FILTER" "$LOG_FILE" || echo "🔍 Sin coincidencias: \"$LOG_FILTER\""
+    else
+        less "$LOG_FILE" 2>/dev/null || cat "$LOG_FILE"
+    fi
+    exit 0
+fi
+
+# ── Historial ──────────────────────────────────────────────────
+save_history() {
+    local query="$1" tmp="$HISTORY_FILE.tmp"
+    if [[ -f "$HISTORY_FILE" ]]; then
+        while IFS='|' read -r ts q; do
+            q="${q# }"
+            [[ "$q" != "$query" ]] && echo "${ts}| ${q}"
+        done < "$HISTORY_FILE" > "$tmp"
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M') | $query" >> "$tmp"
+    tail -n "$HISTORY_MAX" "$tmp" > "$HISTORY_FILE" 2>/dev/null
+    rm -f "$tmp"
+}
+
+pick_from_history() {
+    [[ ! -f "$HISTORY_FILE" || ! -s "$HISTORY_FILE" ]] && { echo "📭 No hay historial aún."; return 1; }
+    local hist_data key selected line query_to_delete
+    hist_data=$(mktemp)
+    reg_tmp "$hist_data"
+
+    tac "$HISTORY_FILE" | while IFS='|' read -r ts q; do
+        echo -e "${q# } \t${ts# }"
+    done > "$hist_data"
+
+    selected=$( \
+        "$FZF" --height=~50% --border=rounded < "$hist_data" \
+               --header=" 📖 Historial | Enter=buscar, Ctrl-d=eliminar " \
+               --with-nth=1 --delimiter=$'\t' \
+               --preview-window=hidden \
+               --expect=ctrl-d) || { rm -f "$hist_data"; return 1; }
+
+    rm -f "$hist_data"
+    key=$(echo "$selected" | head -1)
+    line=$(echo "$selected" | tail -1)
+    [[ -z "$line" ]] && return 1
+
+    if [[ "$key" == "ctrl-d" ]]; then
+        query_to_delete=$(echo "$line" | cut -f1)
+        local tmp="$HISTORY_FILE.tmp"
+        while IFS='|' read -r ts q; do
+            q="${q# }"
+            [[ "$q" != "$query_to_delete" ]] && echo "${ts}| ${q}"
+        done < "$HISTORY_FILE" > "$tmp"
+        mv "$tmp" "$HISTORY_FILE" 2>/dev/null
+        echo "🗑️  Eliminado: $query_to_delete"
+        pick_from_history; return $?
+    fi
+    echo "$line" | cut -f1
+}
+
+# ── Favoritos ──────────────────────────────────────────────────
+show_favorites() {
+    if [[ ! -f "$FAVORITES_FILE" || ! -s "$FAVORITES_FILE" ]]; then
+        echo -e "\n  ${BYLW}⭐ No hay favoritos aún.${R}"
+        echo -e "  ${D}Añade con la tecla [f] durante la reproducción.${R}\n"
+        return 1
+    fi
+    local fav_data selected key lines
+    fav_data=$(mktemp)
+    reg_tmp "$fav_data"
+    cp "$FAVORITES_FILE" "$fav_data"
+    while :; do
+        selected=$( \
+            "$FZF" --height=~60% --border=rounded < "$fav_data" \
+                   --header=" ⭐ Favoritos | Enter=reproducir, Ctrl-d=quitar " \
+                   --with-nth=2 --delimiter=$'\t' \
+                   --preview-window=hidden \
+                   --expect=ctrl-d --multi) || { rm -f "$fav_data"; return 0; }
+        key=$(echo "$selected" | head -1)
+        lines=$(echo "$selected" | tail -n +2)
+        if [[ "$key" == "ctrl-d" ]]; then
+            local ids tmp="$FAVORITES_FILE.tmp"
+            ids=$(echo "$lines" | cut -f1)
+            [[ -z "$ids" ]] && continue
+            : > "$tmp"
+            while IFS=$'\t' read -r fid ftitle; do
+                echo "$ids" | grep -qxF "$fid" || printf '%s\t%s\n' "$fid" "$ftitle"
+            done < "$FAVORITES_FILE" > "$tmp"
+            mv "$tmp" "$FAVORITES_FILE"
+            cp "$FAVORITES_FILE" "$fav_data"
+            echo -e "  ${BGRN}🗑️  Quitado de favoritos.${R}"
+            [[ -s "$fav_data" ]] || { rm -f "$fav_data"; return 0; }
+            continue
+        fi
+        break
+    done
+    rm -f "$fav_data"
+    [[ -z "$lines" ]] && return 0
+    process_selection "$lines" 0 "Favoritos"
+    return $?
+}
+
+clear_search_cache() {
+    local n
+    n=$(find "$CACHE_DIR" -maxdepth 1 \( -name '*.json' -o -name 'playlist_*.json' \) 2>/dev/null | wc -l)
+    find "$CACHE_DIR" -maxdepth 1 -name '*.json' -delete 2>/dev/null || true
+    echo -e "  ${BGRN}🧹 Caché de búsquedas/álbumes borrada ($n archivos).${R}"
+    log_event "CACHE_CLEAR" "removed=$n"
+}
+
+# ── Kill any running mpv by socket + PID ───────────────────────
+_kill_mpv() {
+    local sock="$1"
+    # Kill via IPC socket
+    if [[ -S "$sock" ]]; then
+        python3 -c "
+import socket, json
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.2)
+    s.connect('$sock')
+    s.sendall((json.dumps({'command': ['quit']}) + '\n').encode())
+    s.close()
+except: pass
+" 2>/dev/null || true
+        sleep 0.1
+    fi
+    # Also kill any orphan mpv on this socket by PID file
+    local mpv_pid_file="${sock}.pid"
+    if [[ -f "$mpv_pid_file" ]]; then
+        kill "$(cat "$mpv_pid_file")" 2>/dev/null || true
+        rm -f "$mpv_pid_file"
+    fi
+    # Nuclear option: kill any mpv using our socket
+    pkill -f "input-ipc-server=$sock" 2>/dev/null; true
+    rm -f "$sock"
+}
+
+# ── Process selection / play ───────────────────────────────────
+process_selection() {
+    local selected="$1"
+    local start_idx="${2:-0}"
+    local label="${3:-}"
+    local sock_file="/tmp/mpv-ytm.sock"
+
+    # Always kill any existing mpv before starting new one
+    _kill_mpv "$sock_file"
+    rm -f "$sock_file"
+
+    local selected_count
+    selected_count=$(echo "$selected" | grep -v '^[[:space:]]*$' | wc -l)
+    if [[ "$selected_count" -eq 1 && "$start_idx" -eq 0 ]]; then
+        local first_item
+        first_item=$(echo "$selected" | cut -f1)
+        # Si es un álbum/playlist URL, navegar directamente
+        if [[ "$first_item" =~ (playlist\?list=|list=|/album/) ]]; then
+            local album_label
+            album_label=$(echo "$selected" | head -1 | cut -f2- | sed 's/ \[[^]]*\]$//')
+            browse_playlist "$first_item" "$album_label"; return $?
+        fi
+    fi
+
+    local lines=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue; lines+=("$line")
+    done <<< "$selected"
+    local num_lines=${#lines[@]}
+    [[ "$num_lines" -eq 0 ]] && return 0
+    [[ "$start_idx" -lt 0 || "$start_idx" -ge "$num_lines" ]] && start_idx=0
+
+    local cache_fmt="bestaudio/best"
+
+    # Pre-download starting track
+    local start_cached=""
+    if [[ "$DOWNLOAD" == "0" ]]; then
+        local start_vid
+        start_vid=$(echo "${lines[$start_idx]}" | cut -f1)
+        local start_url
+        if [[ "$start_vid" =~ ^https?:// ]]; then start_url="$start_vid"
+        else start_url="https://youtube.com/watch?v=$start_vid"; fi
+
+        start_cached=$(get_cached_file "$start_url") || start_cached=""
+        if [[ -z "$start_cached" ]]; then
+            local start_title
+            start_title=$(echo "${lines[$start_idx]}" | cut -f2- | sed 's/ \[.*//')
+            [[ -z "$start_title" ]] && start_title="$start_url"
+            echo -e "  ${BCYN}⏳ Descargando:${R} ${B}$start_title${R}"
+            if timeout 10 "$YT_DLP" -f "$cache_fmt" --no-playlist -o "$CACHE_MEDIA_DIR/%(id)s.webm" "$start_url" >/dev/null 2>&1; then
+                start_cached=$(get_cached_file "$start_url") || start_cached=""; prune_cache
+            else
+                echo -e "  ${BYLW}⚠️  Streaming directo...${R}"
+            fi
+        fi
+    fi
+
+    # Build URL list
+    local urls=()
+    for ((i=0; i<num_lines; i++)); do
+        local vid
+        vid=$(echo "${lines[$i]}" | cut -f1)
+        [[ -z "$vid" || "$vid" == "?" ]] && continue
+        local url
+        if [[ "$vid" =~ ^https?:// ]]; then url="$vid"
+        else url="https://youtube.com/watch?v=$vid"; fi
+
+        if [[ "$DOWNLOAD" == "1" ]]; then
+            local title
+            title=$(echo "${lines[$i]}" | cut -f2- | sed 's/ \[.*//')
+            [[ -z "$title" ]] && title="$url"
+            echo -e "  ${BCYN}🡇 Descargando:${R} $title"
+            "$YT_DLP" -f "$FORMAT" --embed-thumbnail --add-metadata \
+                -o "$DOWNLOAD_DIR/%(title)s.%(ext)s" "$url" 2>&1 | \
+                while IFS= read -r ln; do
+                    [[ "$ln" =~ ^\[download] || "$ln" =~ ^\[Extract] || "$ln" =~ ^\[Merger] ]] && echo "    $ln"
+                done
+        else
+            if [[ "$i" -eq "$start_idx" && -n "$start_cached" ]]; then
+                urls+=("$start_cached")
+            else
+                local cached
+                cached=$(get_cached_file "$url") || cached=""
+                urls+=("${cached:-$url}")
+            fi
+        fi
+    done
+
+    if [[ "$DOWNLOAD" == "1" ]]; then
+        echo -e "  ${BGRN}✅ Completado.${R}"; return 0
+    fi
+    [[ ${#urls[@]} -eq 0 ]] && return 0
+
+    # Limitar a N canciones (-c) si se especificó (0 = todas)
+    if [[ "${PLAY_COUNT:-0}" -gt 0 && "${#urls[@]}" -gt $(( start_idx + PLAY_COUNT )) ]]; then
+        urls=("${urls[@]:0:$(( start_idx + PLAY_COUNT ))}")
+    fi
+
+    # Background cache next tracks (only 2 tracks to avoid bandwidth saturation)
+    if [[ "$num_lines" -gt 1 ]]; then
+        (
+            local max_preload=2
+            local count=0
+            local offset
+            for ((offset=1; offset<num_lines && count<max_preload; offset++)); do
+                local idx=$(( (start_idx + offset) % num_lines ))
+                local vid
+                vid=$(echo "${lines[$idx]}" | cut -f1)
+                local url="https://youtube.com/watch?v=$vid"
+                local cached
+                cached=$(get_cached_file "$url") || cached=""
+                if [[ -z "$cached" ]]; then
+                    count=$((count + 1))
+                    timeout 12 "$YT_DLP" -f "$cache_fmt" --no-playlist \
+                        -o "$CACHE_MEDIA_DIR/%(id)s.webm" "$url" >/dev/null 2>&1 || true
+                    prune_cache
+                fi
+            done
+        ) & disown
+    fi
+
+    # Launch mpv
+    local mpv_args=(
+        --input-ipc-server="$sock_file"
+        --cache=yes --demuxer-max-bytes=${MPV_CACHE_MB}M --demuxer-max-back-bytes=${MPV_CACHE_BACK_MB}M
+        --demuxer-readahead-secs=120 --cache-secs=120 --prefetch-playlist=no
+        --stream-buffer-size=${MPV_STREAM_BUFFER_MB}M
+        --ytdl-raw-options=js-runtimes=node,remote-components=ejs:github
+        --no-video --ytdl-format="bestaudio[ext=m4a]/bestaudio/best"
+    )
+    [[ "$start_idx" -gt 0 ]] && mpv_args+=(--playlist-start="$start_idx")
+    [[ -n "$EQ_ARGS" ]] && mpv_args+=("$EQ_ARGS")
+    [[ -n "$SPEED_ARGS" ]] && mpv_args+=("$SPEED_ARGS")
+
+    log_event "MPV" "launching $PLAYER | tracks=${#urls[@]} | start_idx=$start_idx | audio=$AUDIO_ONLY"
+    start_inhibit
+    "$PLAYER" "${mpv_args[@]}" "${urls[@]}" >>"$MPV_LOG" 2>&1 &
+    local mpv_pid=$!
+    echo "$mpv_pid" > "${sock_file}.pid"
+    log_event "MPV" "started pid=$mpv_pid | socket=$sock_file"
+
+    # Run control script; on ANY exit (crash, signal, normal), clean up
+    # No reactivar errexit si el llamador lo tenía desactivado: los rc 10-13
+    # (buscar) se manejan en el bucle principal, no deben abortar el script.
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    export CACHE_MEDIA_DIR AUDIO_ONLY FORMAT DOWNLOAD_DIR LOG_FILE VERSION PLAYLIST_LABEL="$label"
+    log_event "CONTROL" "start ytm_control v$VERSION"
+    python3 "$SCRIPT_DIR/ytm_control.py" "$sock_file" "$mpv_pid" 2>>"$LOG_FILE"
+    local rc=$?
+    [[ "$had_errexit" == "1" ]] && set -e
+    log_event "CONTROL" "exit rc=$rc"
+
+    # Always kill mpv and clean socket
+    _kill_mpv "$sock_file"
+    stop_inhibit
+    return $rc
+}
+
+# ── Browse playlist/album ─────────────────────────────────────
+browse_playlist() {
+    local url="$1"
+    local label="${2:-}"
+    local fzf_data playlist_cache result_count
+
+    echo -e "  ${BCYN}📂 Cargando contenido...${R}"
+    playlist_cache="$CACHE_DIR/playlist_$(echo "$url" | md5sum | cut -d' ' -f1).json"
+
+    # Reutilizar el listado de pistas si está en caché y no se pidió refrescar
+    local pl_age=-1
+    [[ -f "$playlist_cache" && -s "$playlist_cache" ]] && \
+        pl_age=$(( $(date +%s) - $(stat -c %Y "$playlist_cache" 2>/dev/null || echo 0) ))
+    if [[ "$REFRESH" != "1" && "$pl_age" -ge 0 && "$pl_age" -le "$PLAYLIST_CACHE_TTL" ]]; then
+        echo -e "  ${BCYN}📋 Caché de álbum/lista (${pl_age}s)${R}"
+        log_event "PLAYLIST_CACHE" "Hit: $url | age=${pl_age}s"
+    else
+        "$YT_DLP" --flat-playlist --dump-json --ignore-errors "$url" 2>/dev/null > "$playlist_cache" || {
+            echo "  ${BRED}❌ No se pudo cargar.${R}"; return 1
+        }
+    fi
+    result_count=$(wc -l < "$playlist_cache" 2>/dev/null || echo 0)
+    [[ "$result_count" -eq 0 ]] && { echo "  ${BRED}❌ Sin pistas.${R}"; return 1; }
+
+    fzf_data=$(mktemp)
+
+    reg_tmp "$fzf_data"
+
+    $JQ -r 'def fmt_dur: if . then ((./60 | floor | tostring) + ":" + (. % 60 | tostring | if length == 1 then "0" + . else . end)) else "?" end;
+       "\(.id // "?")\t\(.title // "?")  [\(.channel // .uploader // "?") - \((.duration // -1 | fmt_dur))]"' \
+       "$playlist_cache" > "$fzf_data" 2>/dev/null
+
+    local header=" 💿 Álbum/Lista ($result_count temas) | Enter=play, Alt+a=all "
+    local selected
+    selected=$( \
+        "$FZF" "${_YTM_FZF_OPTS[@]}" < "$fzf_data" \
+               --border-label=" YouTube Music " \
+               --header="$header" \
+               --with-nth=2.. --delimiter=$'\t' \
+               --preview-window=hidden \
+               --bind='alt-a:select-all,alt-d:deselect-all' \
+               --multi) || { rm -f "$fzf_data"; return 0; }
+
+    local tracks
+    tracks=$(echo "$selected" | grep -v '^[[:space:]]*$')
+    [[ -z "$tracks" ]] && { rm -f "$fzf_data"; return 0; }
+
+    # ── Una sola pista → cargar el álbum completo empezando en ella ──
+    local all_tracks="" start_idx=0
+    local sel_count
+    sel_count=$(echo "$tracks" | grep -v '^[[:space:]]*$' | wc -l)
+    if [[ "$sel_count" -eq 1 ]]; then
+        local selected_id line_num
+        selected_id=$(echo "$tracks" | cut -f1)
+        line_num=$(grep -n "^${selected_id}"$'\t' "$fzf_data" | cut -d: -f1 | head -1)
+        if [[ -n "$line_num" ]]; then
+            start_idx=$((line_num - 1))
+            all_tracks=$(cat "$fzf_data")
+            echo -e "  ${BCYN}💿 Álbum completo ($result_count pistas) — iniciando en la pista $((start_idx + 1))${R}"
+        fi
+    fi
+
+    rm -f "$fzf_data"
+
+    if [[ -n "$all_tracks" ]]; then
+        process_selection "$all_tracks" "$start_idx" "$label"
+    else
+        process_selection "$tracks" 0 "$label"
+    fi
+    return $?
+}
+
+# ── Search functions ──────────────────────────────────────────
+do_search() {
+    local query="$1" search_type="$2"
+    local cache_file="$CACHE_DIR/$(echo "$query $search_type" | md5sum | cut -d' ' -f1).json"
+    local encoded_query
+    encoded_query=$($JQ -rn --arg q "$query" '$q|@uri')
+
+    # ── Caché de búsqueda: reutilizar si es menor a SEARCH_CACHE_TTL (salvo --refresh) ──
+    local use_cache=0
+    if [[ "$REFRESH" != "1" && -f "$cache_file" && -s "$cache_file" ]]; then
+        local cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+        if [[ "$cache_age" -le "$SEARCH_CACHE_TTL" ]]; then
+            local result_count
+            result_count=$(wc -l < "$cache_file" 2>/dev/null || echo 0)
+            if [[ "$result_count" -gt 0 ]]; then
+                echo -e "  ${BCYN}📋 Caché de búsqueda: \"$query\" ($search_type, ${cache_age}s)${R}"
+                log_event "SEARCH_CACHE" "Hit: $query ($search_type) | age=${cache_age}s"
+                use_cache=1
+            fi
+        fi
+    fi
+
+    if [[ "$use_cache" != "1" ]]; then
+        case "$search_type" in
+        songs)
+            echo -e "  ${BMAG}🎵 Buscando canciones:${R} ${B}$query${R}"
+            log_event "YTM_SONGS" "Query: $query | max=$MAX_RESULTS"
+            "$YT_DLP" --flat-playlist --dump-json --ignore-errors \
+                "ytsearch${MAX_RESULTS}:${query} audio" 2>/dev/null > "$cache_file" || {
+                echo "  ${BRED}❌ Búsqueda fallida.${R}"
+                log_event "ERROR" "Song search failed: $query"; return 1
+            } ;;
+        albums)
+            echo -e "  ${BMAG}💿 Buscando álbumes:${R} ${B}$query${R}"
+            log_event "YTM_ALBUMS" "Query: $query | max=$MAX_RESULTS"
+            "$YT_DLP" --flat-playlist --dump-json --ignore-errors \
+                "https://www.youtube.com/results?search_query=${encoded_query}+album&sp=EgIQAw%253D%253D" 2>/dev/null > "$cache_file" || {
+                echo "  ${BRED}❌ Búsqueda fallida.${R}"
+                log_event "ERROR" "Album search failed: $query"; return 1
+            } ;;
+        playlists)
+            echo -e "  ${BMAG}📜 Buscando playlists:${R} ${B}$query${R}"
+            log_event "YTM_PLAYLISTS" "Query: $query | max=$MAX_RESULTS"
+            "$YT_DLP" --flat-playlist --dump-json --ignore-errors \
+                "https://www.youtube.com/results?search_query=${encoded_query}+playlist&sp=EgIQAw%253D%253D" 2>/dev/null > "$cache_file" || {
+                echo "  ${BRED}❌ Búsqueda fallida.${R}"
+                log_event "ERROR" "Playlist search failed: $query"; return 1
+            } ;;
+    esac
+    fi
+
+    local result_count
+    result_count=$(wc -l < "$cache_file" 2>/dev/null || echo 0)
+    if [[ "$result_count" -eq 0 ]]; then
+        echo "  ${BRED}❌ Sin resultados para: $query${R}"; return 1
+    fi
+    log_event "SEARCH" "Results: $result_count for \"$query\" ($search_type)"
+    save_history "$query"
+
+    if [[ "$LIST_ONLY" == "1" ]]; then
+        echo ""
+        echo -e "  ${BCYN}📋 Resultados: $query${R}"
+        case "$search_type" in
+            songs)
+                $JQ -r '"  ▶ \(.title // "?")\n    👤 \(.channel // .uploader // "?")  ⏱ \(.duration_string // "?")"' \
+                   "$cache_file" 2>/dev/null ;;
+            *)
+                $JQ -r '"  ▶ \(.title // "?")\n    👤 \(.channel // .uploader // "?")"' \
+                   "$cache_file" 2>/dev/null ;;
+        esac
+        echo ""; exit 0
+    fi
+
+    # Interactive selection
+    local fzf_data
+    fzf_data=$(mktemp)
+    reg_tmp "$fzf_data"
+
+    case "$search_type" in
+        songs)
+            $JQ -r 'def fmt_dur: if .duration then ((.duration/60 | floor | tostring) + ":" + (.duration % 60 | tostring | if length == 1 then "0" + . else . end)) else (.duration_string // "?") end;
+               "\(.id // "?")\t\(.title // "?")  [\(.channel // .uploader // "YouTube") - \(fmt_dur)]"' \
+               "$cache_file" > "$fzf_data" 2>/dev/null ;;
+        albums|playlists)
+            $JQ -r 'select((.url // "") | contains("playlist?list=") or ((.id // "") | startswith("PL") or startswith("OLAK5uy_") or startswith("RDCLAK5uy_"))) |
+               "\(.url // "https://www.youtube.com/playlist?list=" + .id)\t\(.title // "?")  [\(.channel // .uploader // "?")]"' \
+               "$cache_file" > "$fzf_data" 2>/dev/null ;;
+    esac
+
+    local mode_label
+    case "$search_type" in
+        songs)     mode_label="🎵 Canciones" ;;
+        albums)    mode_label="💿 Álbumes" ;;
+        playlists) mode_label="📜 Playlists" ;;
+    esac
+    [[ "$DOWNLOAD" == "1" ]] && mode_label="🡇 Descarga · $mode_label"
+
+    local header=" ${mode_label} · ${query} | Enter=play, Alt+a=all, Tab=multi "
+    local selected
+    selected=$( \
+        "$FZF" "${_YTM_FZF_OPTS[@]}" < "$fzf_data" \
+               --border-label=" YouTube Music " \
+               --header="$header" \
+               --with-nth=2.. --delimiter=$'\t' \
+               --preview-window=hidden \
+               --bind='ctrl-i:toggle-preview,?:toggle-preview' \
+               --bind='alt-a:select-all,alt-d:deselect-all' \
+               --multi) || { rm -f "$fzf_data"; return 0; }
+
+    rm -f "$fzf_data"
+    local tracks
+    tracks=$(echo "$selected" | grep -v '^[[:space:]]*$')
+    [[ -z "$tracks" ]] && return 0
+
+    process_selection "$tracks" 0 "$query"
+    return $?
+}
+
+# ── Mode menu (when no args) ─────────────────────────────────
+show_mode_menu() {
+    while true; do
+        clear
+        _draw_banner
+        echo ""
+
+        # Build mode items for fzf
+        local mode_data
+        mode_data=$(mktemp)
+        reg_tmp "$mode_data"
+        cat > "$mode_data" <<MODES
+1	🎵  Canciones		Buscar y reproducir canciones
+2	💿  Álbumes		Explorar álbumes completos
+3	📜  Playlists		Listas de reproducción
+4	🔀  Artista		Buscar por nombre de artista
+5	📖  Historial		Buscar en historial reciente
+6	⭐  Favoritos		Reproducir pistas favoritas
+7	⚙️   Configuración	Ver/cambiar opciones actuales
+MODES
+
+        local mode_selected
+        mode_selected=$( \
+            "$FZF" "${_YTM_FZF_OPTS[@]}" < "$mode_data" \
+                   --border-label=" YouTube Music " \
+                   --height=~45% --border=rounded \
+                   --header=" 🎵 Selecciona un modo " \
+                   --with-nth=2,3 --delimiter=$'\t' \
+                   --preview-window=hidden \
+                   --prompt="  ♪ ") \
+            || { rm -f "$mode_data"; echo -e "\n  ${D}Hasta luego! 🎵${R}"; exit 0; }
+
+        rm -f "$mode_data"
+        local choice
+        choice=$(echo "$mode_selected" | cut -f1)
+
+        case "$choice" in
+            1) SEARCH_TYPE="songs"; query_prompt "Canción" && break ;;
+            2) SEARCH_TYPE="albums"; query_prompt "Álbum" && break ;;
+            3) SEARCH_TYPE="playlists"; query_prompt "Lista" && break ;;
+            4)
+                SEARCH_TYPE="songs"
+                echo -e "\n  ${BCYN}🔀 Nombre del artista:${R} "
+                read -r artist_name
+                [[ -z "$artist_name" ]] && continue
+                SEARCH_QUERY=("$artist_name"); break ;;
+            5)
+                local hq
+                hq=$(pick_from_history) || continue
+                [[ -n "$hq" ]] && { SEARCH_QUERY=("$hq"); break; } ;;
+            6) show_favorites || true; continue ;;
+            7) show_config; continue ;;
+            *) continue ;;
+        esac
+    done
+}
+
+query_prompt() {
+    local label="$1"
+    echo -e "\n  ${BMAG}🔍 Buscar ${label}:${R} "
+    read -r input_query || input_query=""
+    if [[ -z "$input_query" ]]; then
+        echo -e "\n  ${D}Cancelado.${R}"
+        return 1
+    fi
+    SEARCH_QUERY=("$input_query")
+    return 0
+}
+
+# Traduce un rc de búsqueda (10-13) a su tipo y pide la consulta.
+prompt_for_type() {
+    case "$1" in
+        10|11) SEARCH_TYPE="songs" ;;
+        12)    SEARCH_TYPE="albums" ;;
+        13)    SEARCH_TYPE="playlists" ;;
+        *)     return 1 ;;
+    esac
+    local label
+    case "$SEARCH_TYPE" in
+        songs)     label="Canción" ;;
+        albums)    label="Álbum" ;;
+        playlists) label="Lista" ;;
+    esac
+    query_prompt "$label"
+}
+
+show_config() {
+    local w; w=$(_get_cols)
+    local fav_count=0
+    [[ -f "$FAVORITES_FILE" ]] && fav_count=$(grep -c . "$FAVORITES_FILE" 2>/dev/null || echo 0)
+    clear; echo ""
+    _box_top "$w" "$BMAG"
+    _box_center "${BMAG}${B}⚙  Configuración${R}" "$w" "$BMAG"
+    _box_mid "$w" "$BMAG"
+    _box_center "${WHT}📊 Resultados:    ${B}${MAX_RESULTS}${R}" "$w" "$BMAG"
+    _box_center "${WHT}📥 Formato:       ${B}${FORMAT}${R}" "$w" "$BMAG"
+    _box_center "${WHT}🎚  Ecualizador:   ${B}${EQ_PRESET:-flat}${R}" "$w" "$BMAG"
+    _box_center "${WHT}⚡ Velocidad:     ${B}${SPEED_FACTOR:-1.0x}${R}" "$w" "$BMAG"
+    _box_center "${WHT}🔕 Bloquear sleep:${B}${INHIBIT_IDLE}${R}" "$w" "$BMAG"
+    _box_center "${WHT}🗄  Caché búsqueda:${B}${SEARCH_CACHE_TTL}s${R}" "$w" "$BMAG"
+    _box_center "${WHT}🗄  Caché álbumes: ${B}${PLAYLIST_CACHE_TTL}s${R}" "$w" "$BMAG"
+    _box_center "${WHT}📦 Tope caché:    ${B}${CACHE_MAX_MB} MB${R}" "$w" "$BMAG"
+    _box_center "${WHT}🎞  Búfer mpv:     ${B}${MPV_CACHE_MB}/${MPV_CACHE_BACK_MB}/${MPV_STREAM_BUFFER_MB} MB${R}" "$w" "$BMAG"
+    _box_center "${WHT}⭐ Favoritos:     ${B}${fav_count}${R}" "$w" "$BMAG"
+    _box_bottom "$w" "$BMAG"
+    echo ""
+    echo -e "  ${D}ytm -n 20 -e bass -S 1.0 <búsqueda>${R}"
+    echo -e "  ${D}ytm -R <búsqueda>  (ignorar caché)   ytm --clear-cache${R}"
+    echo -e "  ${D}Presiona Enter para volver...${R}"
+    read -r
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+# Cleanup on exit: kill any orphan mpv we started
+# Limpieza global al salir: temporales + inhibidor + mpv
+_TMP_FILES=()
+reg_tmp() { _TMP_FILES+=("$1"); }
+cleanup() {
+    local f
+    if (( ${#_TMP_FILES[@]} > 0 )); then
+        for f in "${_TMP_FILES[@]}"; do
+            [[ -n "$f" ]] && rm -f "$f"
+        done
+    fi
+    stop_inhibit
+    _kill_mpv /tmp/mpv-ytm.sock 2>/dev/null || true
+    rm -f /tmp/mpv-ytm.sock.pid
+}
+trap cleanup EXIT
+
+# Poda de JSON de búsquedas/playlists por edad y tope de tamaño
+prune_search_cache() {
+    local dir="$1" now f age total_kb max_mb
+    [[ -d "$dir" ]] || return 0
+    now=$(date +%s)
+
+    while IFS= read -r -d '' f; do
+        age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo "$now") ))
+        [[ "$age" -le "$SEARCH_CACHE_TTL" ]] || rm -f "$f"
+    done < <(find "$dir" -maxdepth 1 -type f -name '*.json' ! -name 'playlist_*.json' -print0 2>/dev/null)
+
+    while IFS= read -r -d '' f; do
+        age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo "$now") ))
+        [[ "$age" -le "$PLAYLIST_CACHE_TTL" ]] || rm -f "$f"
+    done < <(find "$dir" -maxdepth 1 -type f -name 'playlist_*.json' -print0 2>/dev/null)
+
+    max_mb="${CACHE_MAX_MB:-200}"
+    [[ "$max_mb" -gt 0 ]] || return 0
+    total_kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+    if [[ "${total_kb:-0}" -gt $(( max_mb * 1024 )) ]]; then
+        while IFS= read -r f; do
+            [[ -f "$f" ]] || continue
+            rm -f "$f"
+            total_kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+            [[ "${total_kb:-0}" -le $(( max_mb * 1024 )) ]] && break
+        done < <(find "$dir" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+    fi
+}
+
+# Recorta mpv.log al último MB configurado
+rotate_mpv_log() {
+    local max="${MPV_LOG_MAX_BYTES:-1048576}" size
+    [[ -f "$MPV_LOG" ]] || return 0
+    size=$(stat -c %s "$MPV_LOG" 2>/dev/null || echo 0)
+    [[ "${size:-0}" -gt "$max" ]] || return 0
+    tail -c "$max" "$MPV_LOG" > "$MPV_LOG.tmp" 2>/dev/null && mv "$MPV_LOG.tmp" "$MPV_LOG" || rm -f "$MPV_LOG.tmp"
+}
+
+prune_search_cache "$CACHE_DIR"
+rotate_mpv_log
+log_event "START" "ytm v$VERSION launched"
+
+[[ "$CLEAR_CACHE" == "1" ]] && clear_search_cache
+if [[ "$OPEN_FAVORITES" == "1" ]]; then
+    show_favorites || true
+    SEARCH_QUERY=()
+fi
+
+if [[ ${#SEARCH_QUERY[@]} -gt 0 && "$YTM_MODE" != "auto" ]]; then
+    SEARCH_TYPE="$YTM_MODE"
+fi
+
+while true; do
+    # Si no hay búsqueda pendiente, pedir modo + consulta con el menú
+    if [[ ${#SEARCH_QUERY[@]} -eq 0 ]]; then
+        show_mode_menu
+        [[ ${#SEARCH_QUERY[@]} -eq 0 ]] && continue
+    fi
+
+    query="${SEARCH_QUERY[*]}"
+    set +e
+    do_search "$query" "$SEARCH_TYPE"
+    rc=$?
+    set -e
+    SEARCH_QUERY=()
+
+    # rc 10-13 = el control pidió otra búsqueda (teclas s/m/a/l) -> pedir consulta
+    if (( rc >= EXIT_SEARCH_SONGS && rc <= EXIT_SEARCH_PLAYLISTS )); then
+        prompt_for_type "$rc" || true
+        continue
+    fi
+
+    # rc 0 = usuario salió de reproducción -> volver al menú
+    # rc ≠ 0 = error de mpv/conexión -> salir de ytm
+    if [[ "$rc" -ne 0 ]]; then
+        exit "$rc"
+    fi
+done
