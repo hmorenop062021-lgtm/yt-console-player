@@ -155,6 +155,14 @@ _box_bottom() { printf "${2:-$BCYN}╰"; _repeat "─" $(( ${1:-$(_get_cols)} - 
 _draw_banner() {
     local w
     w=$(_get_cols)
+    # Terminal muy angosta (móvil en vertical): banner compacto sin caja
+    if (( w < 30 )); then
+        echo ""
+        echo -e "  ${BMAG}${B}♪ YouTube Music ♪${R}"
+        echo -e "  ${DIM}v$VERSION${R}"
+        echo ""
+        return
+    fi
     echo ""
     _box_top "$w" "$BCYN"
     _box_center "" "$w" "$BCYN"

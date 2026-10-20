@@ -759,6 +759,7 @@ echo "━━━ 18. UI CENTRADO / ANTI-SCROLL ━━━"
 grep -q "DIM='" "$BIN/ytm" && ok "ytm define DIM" || fail "ytm sin DIM (variable sin asignar)"
 grep -Fq 'echo $(( c - 1 ))' "$BIN/ytm" && ok "ytm deja 1 columna libre (anti-wrap)" || fail "ytm sin margen anti-wrap"
 grep -q 'if \[\[ -z "$mode_selected" \]\]; then' "$BIN/ytm" && ok "ytm guarda anti-bucle de menú" || fail "ytm sin guarda anti-bucle"
+grep -q 'w < 30' "$BIN/ytm" && ok "ytm banner compacto en terminal angosta" || fail "ytm sin banner compacto"
 out=$(BIN="$BIN" bash <<'EOV'
 source <(sed -n '/^_vis_len()/,/^}/p' "$BIN/ytm")
 t='\033[1;35m\033[1m♪  YouTube Music Player  ♪\033[0m'
