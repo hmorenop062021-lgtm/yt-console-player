@@ -716,6 +716,25 @@ fi
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════
+# 16. NUEVOS MENÚS DE UI (álbumes, relacionados, radio)
+# ══════════════════════════════════════════════════════════════════════
+echo "━━━ 16. NUEVOS MENÚS DE UI ━━━"
+grep -q 'save_last_song()' "$BIN/ytm" && ok "ytm tiene save_last_song()" || fail "ytm sin save_last_song()"
+grep -q 'show_albums_for_song()' "$BIN/ytm" && ok "ytm tiene show_albums_for_song()" || fail "ytm sin show_albums_for_song()"
+grep -q 'show_related_songs()' "$BIN/ytm" && ok "ytm tiene show_related_songs()" || fail "ytm sin show_related_songs()"
+grep -q 'show_radio_menu()' "$BIN/ytm" && ok "ytm tiene show_radio_menu()" || fail "ytm sin show_radio_menu()"
+grep -q 'LAST_SONG_FILE=' "$BIN/ytm" && ok "ytm define LAST_SONG_FILE" || fail "ytm sin LAST_SONG_FILE"
+grep -q 'RADIO_MODE=0' "$BIN/ytm" && ok "ytm define RADIO_MODE=0" || fail "ytm sin RADIO_MODE"
+grep -q '8.*💿  Álbumes de…' "$BIN/ytm" && ok "ytm menú opción 8 álbumes" || fail "ytm sin opción 8 menú"
+grep -q '9.*🔀  Relacionados' "$BIN/ytm" && ok "ytm menú opción 9 relacionados" || fail "ytm sin opción 9 menú"
+grep -q '10.*📻  Radio…' "$BIN/ytm" && ok "ytm menú opción 10 radio" || fail "ytm sin opción 10 menú"
+grep -q 'show_albums_for_song && break' "$BIN/ytm" && ok "ytm case opción 8 conectado" || fail "ytm case 8 no conectado"
+grep -q 'show_related_songs && break' "$BIN/ytm" && ok "ytm case opción 9 conectado" || fail "ytm case 9 no conectado"
+grep -q 'show_radio_menu && break' "$BIN/ytm" && ok "ytm case opción 10 conectado" || fail "ytm case 10 no conectado"
+grep -q 'if \[\[ "$RADIO_MODE" == "1" && "$rc" -eq 0 \]\]; then' "$BIN/ytm" && ok "ytm radio continua repite búsqueda" || fail "ytm radio sin repetición"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════
 # RESUMEN
 # ══════════════════════════════════════════════════════════════════════
 echo "══════════════════════════════════════════════════════════════════════"

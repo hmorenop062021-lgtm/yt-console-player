@@ -299,6 +299,8 @@ LOG_CLEAR=0
 SEARCH_TYPE="songs"
 YTM_MODE="auto"
 PLAY_COUNT=0
+RADIO_MODE=0
+LAST_SONG_FILE="$CACHE_DIR/last_song"
 
 show_help() {
     echo "  📦 ytm v$VERSION"
@@ -323,6 +325,9 @@ MENÚ PRINCIPAL (sin argumentos):
   [5] 📖  Historial      Buscar en historial reciente
   [6] ⭐  Favoritos      Reproducir pistas favoritas
   [7] ⚙️   Configuración  Cambiar opciones
+  [8] 💿  Álbumes de…    Álbumes/playlists de la última canción
+  [9] 🔀  Relacionados   Canciones similares a la última canción
+  [10] 📻  Radio…        Radio continua de la última canción
   [q] 🚪  Salir
 
 OPCIONES:
@@ -512,6 +517,55 @@ show_favorites() {
     return $?
 }
 
+# ── Guardar última canción reproducida ─────────────────────────
+save_last_song() {
+    local vid="$1" title="$2" channel="$3"
+    [[ -z "$vid" || "$vid" == "?" ]] && return 0
+    printf '%s\t%s\t%s\n' "$vid" "$title" "$channel" > "$LAST_SONG_FILE"
+    reg_tmp "$LAST_SONG_FILE"
+}
+
+# ── Álbumes y playlists de la última canción ──────────────────
+show_albums_for_song() {
+    [[ ! -f "$LAST_SONG_FILE" || ! -s "$LAST_SONG_FILE" ]] && { echo -e "\n  ${BYLW}No hay canción reciente.${R}\n"; return 1; }
+    IFS=$'\t' read -r vid title channel < "$LAST_SONG_FILE"
+    SEARCH_TYPE="albums"
+    SEARCH_QUERY=("$title $channel")
+    return 0
+}
+
+# ── Canciones similares (mismo canal/artista) ─────────────────
+show_related_songs() {
+    [[ ! -f "$LAST_SONG_FILE" || ! -s "$LAST_SONG_FILE" ]] && { echo -e "\n  ${BYLW}No hay canción reciente.${R}\n"; return 1; }
+    IFS=$'\t' read -r vid title channel < "$LAST_SONG_FILE"
+    SEARCH_TYPE="songs"
+    SEARCH_QUERY=("$channel $title")
+    return 0
+}
+
+# ── Radio continua de canciones relacionadas ──────────────────
+show_radio_menu() {
+    [[ ! -f "$LAST_SONG_FILE" || ! -s "$LAST_SONG_FILE" ]] && { echo -e "\n  ${BYLW}No hay canción reciente.${R}\n"; return 1; }
+    IFS=$'\t' read -r vid title channel < "$LAST_SONG_FILE"
+    clear
+    _draw_banner
+    echo ""
+    _box_top "$(_get_cols)" "$BMAG"
+    _box_center "${BMAG}${B}📻  Radio:${R} ${B}$title${R}" "$(_get_cols)" "$BMAG"
+    _box_center "${DIM}$channel${R}" "$(_get_cols)" "$BMAG"
+    _box_center "" "$(_get_cols)" "$BMAG"
+    _box_center "${DIM}Reproduciendo canciones relacionadas en bucle…${R}" "$(_get_cols)" "$BMAG"
+    _box_center "${DIM}Presiona q/Esc en el reproductor para salir.${R}" "$(_get_cols)" "$BMAG"
+    _box_bottom "$(_get_cols)" "$BMAG"
+    echo ""
+    echo -e "  ${D}Iniciando en 2 s…${R}"
+    sleep 2
+    SEARCH_TYPE="songs"
+    SEARCH_QUERY=("$channel $title")
+    RADIO_MODE=1
+    return 0
+}
+
 clear_search_cache() {
     local n
     n=$(find "$CACHE_DIR" -maxdepth 1 \( -name '*.json' -o -name 'playlist_*.json' \) 2>/dev/null | wc -l)
@@ -668,6 +722,13 @@ process_selection() {
             done
         ) & disown
     fi
+
+    # Guardar última canción para menús relacionados/radio
+    local first_vid first_title first_channel
+    first_vid=$(echo "${lines[$start_idx]}" | cut -f1)
+    first_title=$(echo "${lines[$start_idx]}" | cut -f2- | sed 's/  \[.*//')
+    first_channel=$(echo "${lines[$start_idx]}" | sed 's/.*  \[//' | sed 's/ - .*//')
+    save_last_song "$first_vid" "$first_title" "$first_channel"
 
     # Launch mpv
     local mpv_args=(
@@ -917,6 +978,9 @@ show_mode_menu() {
 5	📖  Historial		Buscar en historial reciente
 6	⭐  Favoritos		Reproducir pistas favoritas
 7	⚙️   Configuración	Ver/cambiar opciones actuales
+8	💿  Álbumes de...	Álbumes y playlists de la última canción
+9	🔀  Relacionados	Canciones similares a la última
+10	📻  Radio…		Radio continua de la última canción
 MODES
 
         local mode_selected
@@ -950,6 +1014,9 @@ MODES
                 [[ -n "$hq" ]] && { SEARCH_QUERY=("$hq"); break; } ;;
             6) show_favorites || true; continue ;;
             7) show_config; continue ;;
+            8) show_albums_for_song && break ;;
+            9) show_related_songs && break ;;
+            10) show_radio_menu && break ;;
             *) continue ;;
         esac
     done
@@ -1100,6 +1167,11 @@ while true; do
     # rc 10-13 = el control pidió otra búsqueda (teclas s/m/a/l) -> pedir consulta
     if (( rc >= EXIT_SEARCH_SONGS && rc <= EXIT_SEARCH_PLAYLISTS )); then
         prompt_for_type "$rc" || true
+        continue
+    fi
+
+    # Radio continua: repetir búsqueda automáticamente al salir de reproducción
+    if [[ "$RADIO_MODE" == "1" && "$rc" -eq 0 ]]; then
         continue
     fi
 
