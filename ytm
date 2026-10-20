@@ -1164,8 +1164,33 @@ while true; do
     set -e
     SEARCH_QUERY=()
 
-    # rc 10-13 = el control pidió otra búsqueda (teclas s/m/a/l) -> pedir consulta
+    # rc 10-13 = el control pidió otra búsqueda (teclas s/m/a/l/r/R)
     if (( rc >= EXIT_SEARCH_SONGS && rc <= EXIT_SEARCH_PLAYLISTS )); then
+        local action_file="$CACHE_DIR/action"
+        if [[ -f "$action_file" ]]; then
+            local action
+            action=$(cat "$action_file" 2>/dev/null || echo "")
+            rm -f "$action_file"
+            case "$action" in
+                related)
+                    if [[ -f "$LAST_SONG_FILE" && -s "$LAST_SONG_FILE" ]]; then
+                        IFS=$'\t' read -r _vid _title _channel < "$LAST_SONG_FILE"
+                        SEARCH_TYPE="songs"
+                        SEARCH_QUERY=("$_channel $_title")
+                        break
+                    fi
+                    ;;
+                radio)
+                    if [[ -f "$LAST_SONG_FILE" && -s "$LAST_SONG_FILE" ]]; then
+                        IFS=$'\t' read -r _vid _title _channel < "$LAST_SONG_FILE"
+                        SEARCH_TYPE="songs"
+                        SEARCH_QUERY=("$_channel $_title")
+                        RADIO_MODE=1
+                        break
+                    fi
+                    ;;
+            esac
+        fi
         prompt_for_type "$rc" || true
         continue
     fi

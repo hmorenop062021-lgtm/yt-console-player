@@ -637,6 +637,22 @@ def main():
                     client.send_command(["set", "speed", 1.0])
                     st["fb"] = "▶ Vel: 1.00x"; st["fb_t"] = time.time()
 
+                elif key in ("r", "R"):
+                    # Relacionados (r) / Radio continua (R) de la última canción
+                    try:
+                        action = "radio" if key == "R" else "related"
+                        with open(os.path.expanduser("~/.cache/ytm/action"), "w") as f:
+                            f.write(action)
+                    except OSError:
+                        pass
+                    try:
+                        client.send_command(["quit"])
+                    except Exception:
+                        pass
+                    client._close_socket()
+                    restore_terminal()
+                    sys.exit(EXIT_SEARCH_SONGS)
+
                 elif key in ("s", "S", "/"):
                     # Search YouTube - asegurar limpieza de mpv
                     try:
