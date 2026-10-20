@@ -68,14 +68,22 @@ validate_dependencies() {
 validate_dependencies
 
 # ── Colores ANSI ────────────────────────────────────────────────
-R='\033[0m'    B='\033[1m'    D='\033[2m'
+R='\033[0m'    B='\033[1m'    D='\033[2m'    DIM='\033[2m'
 RED='\033[31m' GRN='\033[32m' YLW='\033[33m'
 BLU='\033[34m' MAG='\033[35m' CYN='\033[36m' WHT='\033[37m'
 BRED='\033[1;31m' BGRN='\033[1;32m' BYLW='\033[1;33m'
 BBLU='\033[1;34m' BMAG='\033[1;35m' BCYN='\033[1;36m' BWHT='\033[1;37m'
 
 # ── Terminal width (recalculated every render) ──────────────────
-_get_cols() { tput cols 2>/dev/null || echo 80; }
+_get_cols() {
+    local c
+    c=$(tput cols 2>/dev/null || echo 80)
+    [[ "$c" =~ ^[0-9]+$ ]] || c=80
+    (( c > 2 )) || c=80
+    # Deja 1 columna libre: escribir en la última provoca auto-wrap/scroll
+    # en algunas terminales (p. ej. Termux).
+    echo $(( c - 1 ))
+}
 
 # ── Wide-character length: emojis + CJK = 2 cols each ──────────
 # Uses python for reliable counting since bash can't handle multi-byte.
@@ -85,7 +93,7 @@ _vis_len() {
 import sys, unicodedata, re
 s = sys.argv[1]
 # strip ANSI
-s = re.sub(r'\033\[[0-9;]*m', '', s)
+s = re.sub(r'(?:\x1b|\\\\033)\[[0-9;]*m', '', s)
 w = 0
 for ch in s:
     eaw = unicodedata.east_asian_width(ch)
@@ -1001,6 +1009,10 @@ MODES
             || { rm -f "$mode_data"; echo -e "\n  ${D}Hasta luego! 🎵${R}"; exit 0; }
 
         rm -f "$mode_data"
+        if [[ -z "$mode_selected" ]]; then
+            echo -e "\n  ${D}Hasta luego! 🎵${R}"
+            exit 0
+        fi
         local choice
         choice=$(echo "$mode_selected" | cut -f1)
 

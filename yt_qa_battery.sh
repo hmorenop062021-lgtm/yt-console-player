@@ -753,6 +753,29 @@ grep -q 'pkg install -y nodejs' "$BIN/install-android-termux.sh" && ok "instalad
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════
+# 18. UI: CENTRADO Y ANTI-SCROLL
+# ══════════════════════════════════════════════════════════════════════
+echo "━━━ 18. UI CENTRADO / ANTI-SCROLL ━━━"
+grep -q "DIM='" "$BIN/ytm" && ok "ytm define DIM" || fail "ytm sin DIM (variable sin asignar)"
+grep -Fq 'echo $(( c - 1 ))' "$BIN/ytm" && ok "ytm deja 1 columna libre (anti-wrap)" || fail "ytm sin margen anti-wrap"
+grep -q 'if \[\[ -z "$mode_selected" \]\]; then' "$BIN/ytm" && ok "ytm guarda anti-bucle de menú" || fail "ytm sin guarda anti-bucle"
+out=$(BIN="$BIN" bash <<'EOV'
+source <(sed -n '/^_vis_len()/,/^}/p' "$BIN/ytm")
+t='\033[1;35m\033[1m♪  YouTube Music Player  ♪\033[0m'
+_vis_len "$t"
+EOV
+)
+[[ "$out" -eq 26 ]] && ok "_vis_len ignora escapes literales (26)" || fail "_vis_len literal=$out (esperado 26)"
+out2=$(BIN="$BIN" bash <<'EOV'
+source <(sed -n '/^_vis_len()/,/^}/p' "$BIN/ytm")
+t=$'\033[1;35m\033[1m♪  YouTube Music Player  ♪\033[0m'
+_vis_len "$t"
+EOV
+)
+[[ "$out2" -eq 26 ]] && ok "_vis_len ignora ESC reales (26)" || fail "_vis_len ESC=$out2"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════
 # RESUMEN
 # ══════════════════════════════════════════════════════════════════════
 echo "══════════════════════════════════════════════════════════════════════"
