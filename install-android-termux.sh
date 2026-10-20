@@ -17,7 +17,10 @@ echo "[termux/android] actualizando índices de paquetes..."
 pkg update -y
 
 echo "[termux/android] instalando dependencias (mpv, yt-dlp, fzf, jq, python)..."
-pkg install -y mpv yt-dlp fzf jq python
+pkg install -y mpv yt-dlp fzf jq python coreutils findutils
+
+# Node.js es opcional pero muy recomendado por yt-dlp para extracción fiable
+pkg install -y nodejs 2>/dev/null || echo "[termux/android] nodejs no disponible; yt-dlp usará extracción básica"
 
 echo "[termux/android] concediendo acceso al almacenamiento interno (Descargas)..."
 termux-setup-storage >/dev/null 2>&1 || true

@@ -16,7 +16,13 @@ VERSION="1.0.0"
 
 # ── Configuración ────────────────────────────────────────────────
 YT_DLP_BIN="${YT_DLP:-yt-dlp}"
-yt_dlp_fn() { "$YT_DLP_BIN" --js-runtimes node --remote-components ejs:github "$@"; }
+if command -v node >/dev/null 2>&1; then
+    yt_dlp_fn() { "$YT_DLP_BIN" --js-runtimes node --remote-components ejs:github "$@"; }
+    YTDL_RAW_OPTS="js-runtimes=node,remote-components=ejs:github"
+else
+    yt_dlp_fn() { "$YT_DLP_BIN" "$@"; }
+    YTDL_RAW_OPTS=""
+fi
 YT_DLP="yt_dlp_fn"
 PLAYER="${PLAYER:-mpv}"
 FZF="${FZF:-fzf}"
@@ -736,9 +742,9 @@ process_selection() {
         --cache=yes --demuxer-max-bytes=${MPV_CACHE_MB}M --demuxer-max-back-bytes=${MPV_CACHE_BACK_MB}M
         --demuxer-readahead-secs=120 --cache-secs=120 --prefetch-playlist=no
         --stream-buffer-size=${MPV_STREAM_BUFFER_MB}M
-        --ytdl-raw-options=js-runtimes=node,remote-components=ejs:github
         --no-video --ytdl-format="bestaudio[ext=m4a]/bestaudio/best"
     )
+    [[ -n "$YTDL_RAW_OPTS" ]] && mpv_args+=(--ytdl-raw-options="$YTDL_RAW_OPTS")
     [[ "$start_idx" -gt 0 ]] && mpv_args+=(--playlist-start="$start_idx")
     [[ -n "$EQ_ARGS" ]] && mpv_args+=("$EQ_ARGS")
     [[ -n "$SPEED_ARGS" ]] && mpv_args+=("$SPEED_ARGS")

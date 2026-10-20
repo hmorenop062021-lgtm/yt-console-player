@@ -22,9 +22,17 @@ export PATH="$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 YT_DLP_BIN="${YT_DLP:-yt-dlp}"
-yt_dlp_fn() {
-    "$YT_DLP_BIN" --js-runtimes node --remote-components ejs:github "$@"
-}
+if command -v node >/dev/null 2>&1; then
+    yt_dlp_fn() {
+        "$YT_DLP_BIN" --js-runtimes node --remote-components ejs:github "$@"
+    }
+    YTDL_RAW_OPTS="js-runtimes=node,remote-components=ejs:github"
+else
+    yt_dlp_fn() {
+        "$YT_DLP_BIN" "$@"
+    }
+    YTDL_RAW_OPTS=""
+fi
 YT_DLP="yt_dlp_fn"
 PLAYER="${PLAYER:-mpv}"
 FZF="${FZF:-fzf}"
@@ -747,8 +755,8 @@ process_selection() {
         --cache-secs=120
         --prefetch-playlist=no
         --stream-buffer-size=${MPV_STREAM_BUFFER_MB}M
-        --ytdl-raw-options=js-runtimes=node,remote-components=ejs:github
     )
+    [[ -n "$YTDL_RAW_OPTS" ]] && mpv_args+=(--ytdl-raw-options="$YTDL_RAW_OPTS")
 
     if [[ "$start_idx" -gt 0 ]]; then
         mpv_args+=(--playlist-start="$start_idx")

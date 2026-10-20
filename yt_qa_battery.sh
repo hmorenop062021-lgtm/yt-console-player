@@ -735,6 +735,24 @@ grep -q 'if \[\[ "$RADIO_MODE" == "1" && "$rc" -eq 0 \]\]; then' "$BIN/ytm" && o
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════
+# 17. PORTABILIDAD TERMUX (Node opcional + diagnóstico)
+# ══════════════════════════════════════════════════════════════════════
+echo "━━━ 17. PORTABILIDAD TERMUX ━━━"
+for f in yt ytm; do
+    grep -q 'command -v node' "$BIN/$f" && ok "$f: runtime Node condicional" || fail "$f: Node no condicional"
+    grep -q 'YTDL_RAW_OPTS=' "$BIN/$f" && ok "$f: define YTDL_RAW_OPTS" || fail "$f: sin YTDL_RAW_OPTS"
+    if grep -q -- '--ytdl-raw-options=js-runtimes=node' "$BIN/$f"; then
+        fail "$f: js-runtimes hardcodeado"
+    else
+        ok "$f: sin js-runtimes hardcodeado"
+    fi
+done
+[[ -x "$BIN/ytm_doctor.sh" ]] && ok "ytm_doctor.sh ejecutable" || fail "ytm_doctor.sh ausente"
+grep -q 'coreutils findutils' "$BIN/install-android-termux.sh" && ok "instalador incluye coreutils/findutils" || fail "instalador sin coreutils"
+grep -q 'pkg install -y nodejs' "$BIN/install-android-termux.sh" && ok "instalador intenta nodejs (opcional)" || fail "instalador sin nodejs"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════
 # RESUMEN
 # ══════════════════════════════════════════════════════════════════════
 echo "══════════════════════════════════════════════════════════════════════"
